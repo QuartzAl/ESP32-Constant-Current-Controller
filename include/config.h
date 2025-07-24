@@ -1,3 +1,4 @@
+#pragma once
 
 // --- Pin Definitions ---
 #define DAC_PIN 25

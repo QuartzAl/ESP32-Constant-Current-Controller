@@ -1,77 +1,132 @@
 // ================================================================= //
-//      ESP32 Constant Current Source Controller Firmware (v7)     //
+//      ESP32/ESP8266 Constant Current Source Firmware (v12)       //
 // ================================================================= //
 //
-// This firmware uses an ESP32 to create a constant current source.
-// It features a PID controller, a web interface for control and
-// monitoring, and uses Server-Sent Events for live data updates.
+// This firmware is compatible with both ESP32 and ESP8266.
 //
-// Required Libraries:
-// - WiFi: for network connection
-// - ESPAsyncWebServer: for creating the web server
-// - WiFiManager by tzapu: for easy WiFi configuration
-// - INA219 by Rob Tillaart: for current and voltage sensing
-// - PID by Brett Beauregard: for PID control loop
+// v12 Changes:
+// - Standardized PID and DAC output to an 8-bit range (0-255) for
+//   both ESP32 and ESP8266, relying on a user-provided dacWrite
+//   wrapper in util.h for ESP8266 compatibility.
+// - Removed platform-specific preprocessor blocks for output logic.
 
-#include <WiFi.h>
-#include <ESPAsyncWebServer.h>
+#ifdef ESP8266
+  #include <ESP8266WiFi.h>
+  #include <ESP8266WebServer.h>
+  #define WebServer ESP8266WebServer // Alias for WebServer
+#else // ESP32
+  #include <WiFi.h>
+  #include <WebServer.h>
+#endif
+
 #include <WiFiManager.h>
 #include <Wire.h>
 #include <INA219.h>
 #include <PID_v1.h>
-#include "index.h"
 #include "config.h"
-
-#ifdef ESP8266
+#include "index.h"
 #include "util.h"
-#endif
 
+
+// --- INA219 Sensor ---
 INA219 ina219(INA219_ADDRESS);
 
 // --- PID Controller ---
-double Setpoint, Input, Output; // PID variables
-double Kp = DEFAULT_KP, Ki = DEFAULT_KI, Kd = DEFAULT_KD;   // PID tuning parameters
+double Setpoint, Input, Output;
+double Kp = DEFAULT_KP, Ki = DEFAULT_KI, Kd = DEFAULT_KD;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 
-// --- Web Server and SSE ---
-AsyncWebServer server(80);
-AsyncEventSource events("/events");
+// --- Web Server ---
+WebServer server(80);
 
 // --- Global Variables ---
 float busVoltage_V = 0;
 float current_mA = 0;
-double targetCurrent_mA = 100.0; // Default target current in mA
-double maxCurrentLimit_mA = 500.0; // Default max current limit
-unsigned long sseInterval = 1000; // Default SSE update interval in ms
+double targetCurrent_mA = 100.0;
+double maxCurrentLimit_mA = 500.0;
 
-// --- Function to scale PID output to DAC value ---
-void setBuckFeedback(double pidOutput) {
-    int dacValue = constrain((int)pidOutput, 1, 255);
-    dacWrite(DAC_PIN, dacValue);
+
+// --- Handler Functions for WebServer ---
+void handleRoot() { server.send_P(200, "text/html", index_html); }
+
+void handleData() {
+    String jsonData = "{";
+    jsonData += "\"voltage\":" + String(busVoltage_V, 2);
+    jsonData += ", \"current\":" + String(current_mA, 2);
+    jsonData += ", \"setpoint\":" + String(targetCurrent_mA, 2);
+    jsonData += ", \"kp\":" + String(Kp);
+    jsonData += ", \"ki\":" + String(Ki);
+    jsonData += ", \"kd\":" + String(Kd);
+    jsonData += ", \"max_limit\":" + String(maxCurrentLimit_mA);
+    jsonData += "}";
+    server.send(200, "application/json", jsonData);
 }
+
+void handleSet() {
+  if (server.hasArg("current")) {
+    double reqCurrent = server.arg("current").toDouble();
+    targetCurrent_mA = min(reqCurrent, maxCurrentLimit_mA);
+    Setpoint = targetCurrent_mA;
+    server.send(200, "text/plain", "OK");
+  } else { server.send(400, "text/plain", "Bad Request"); }
+}
+
+void handleSetPid() {
+  if (server.hasArg("kp") && server.hasArg("ki") && server.hasArg("kd")) {
+    Kp = server.arg("kp").toDouble();
+    Ki = server.arg("ki").toDouble();
+    Kd = server.arg("kd").toDouble();
+    myPID.SetTunings(Kp, Ki, Kd);
+    server.send(200, "text/plain", "OK");
+  } else { server.send(400, "text/plain", "Bad Request"); }
+}
+
+void handleSetAdvanced() {
+    if (server.hasArg("max")) {
+        maxCurrentLimit_mA = server.arg("max").toDouble();
+        ina219.setMaxCurrentShunt(maxCurrentLimit_mA / 1000.0, SHUNT_RESISTOR_OHMS);
+        if (targetCurrent_mA > maxCurrentLimit_mA) {
+            targetCurrent_mA = maxCurrentLimit_mA;
+            Setpoint = targetCurrent_mA;
+        }
+        server.send(200, "text/plain", "OK");
+    } else {
+        server.send(400, "text/plain", "Bad Request");
+    }
+}
+
+// --- Unified output function ---
+void setOutputLevel(double pidOutput) {
+  // This function now relies on the user-provided dacWrite wrapper in util.h
+  // to handle the platform-specific output (DAC for ESP32, PWM for ESP8266).
+  int dacValue = constrain((int)pidOutput, 1, 255);
+  dacWrite(DAC_PIN, dacValue);
+}
+
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(); // Must be called before ina219.begin()
+  #ifdef ESP8266
+    // For ESP8266, the dacWrite wrapper in util.h handles analogWrite setup.
+    // If specific setup like pinMode is needed, it should be in the wrapper.
+  #endif
+  Wire.begin();
 
-  // --- Initialize INA219 ---
   if (!ina219.begin()) {
     Serial.println("Failed to find INA219 chip");
     while (1) { delay(10); }
   }
 
-  // --- Calibrate INA219 ---
   if (!ina219.setMaxCurrentShunt(maxCurrentLimit_mA / 1000.0, SHUNT_RESISTOR_OHMS)) {
-    Serial.println("INA219 calibration failed. Check connection and values.");
+    Serial.println("INA219 calibration failed.");
     while (1) { delay(10); }
   }
   Serial.println("INA219 calibrated successfully.");
 
-  // --- Initialize DAC ---
-  dacWrite(DAC_PIN, 1);
+  setOutputLevel(0);
 
   WiFiManager wm;
-  if (!wm.autoConnect("ESP32-CurrentSource")) {
+  if (!wm.autoConnect("ESP-CurrentSource")) {
     Serial.println("Failed to connect and hit timeout");
     ESP.restart();
   }
@@ -82,107 +137,33 @@ void setup() {
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
-  // --- Web Server Routes ---
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", index_html);
-  });
-
-  server.on("/set", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    if (request->hasParam("current")) {
-        double reqCurrent = request->getParam("current")->value().toDouble();
-        targetCurrent_mA = min(reqCurrent, maxCurrentLimit_mA);
-        Setpoint = targetCurrent_mA;
-        request->send(200, "text/plain", "OK");
-    } else {
-        request->send(400, "text/plain", "Bad Request");
-    }
-  });
-
-  server.on("/setpid", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (request->hasParam("kp") && request->hasParam("ki") && request->hasParam("kd")) {
-        Kp = request->getParam("kp")->value().toDouble();
-        Ki = request->getParam("ki")->value().toDouble();
-        Kd = request->getParam("kd")->value().toDouble();
-        myPID.SetTunings(Kp, Ki, Kd);
-        request->send(200, "text/plain", "OK");
-    } else {
-        request->send(400, "text/plain", "Bad Request");
-    }
-  });
-
-  // --- NEW: Route to set advanced parameters ---
-  server.on("/setadvanced", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (request->hasParam("max")) {
-        maxCurrentLimit_mA = request->getParam("max")->value().toDouble();
-        ina219.setMaxCurrentShunt(maxCurrentLimit_mA / 1000.0, SHUNT_RESISTOR_OHMS);
-        if (targetCurrent_mA > maxCurrentLimit_mA) {
-            targetCurrent_mA = maxCurrentLimit_mA;
-            Setpoint = targetCurrent_mA;
-        }
-    }
-    if (request->hasParam("interval")) {
-        float intervalSeconds = request->getParam("interval")->value().toFloat();
-        // Enforce a minimum of 0.1 seconds (100 ms)
-        if (intervalSeconds < 0.1) {
-            intervalSeconds = 0.1;
-        }
-        sseInterval = (unsigned long)(intervalSeconds * 1000);
-    }
-    request->send(200, "text/plain", "OK");
-  });
-
-  // --- Server-Sent Events Setup ---
-  events.onConnect([](AsyncEventSourceClient *client){
-    if(client->lastId()){
-      Serial.printf("Client reconnected! Last ID: %u\n", client->lastId());
-    }
-    client->send("hello!", NULL, millis(), 1000);
-  });
-  server.addHandler(&events);
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/data", HTTP_GET, handleData); // New endpoint for data
+  server.on("/set", HTTP_GET, handleSet);
+  server.on("/setpid", HTTP_GET, handleSetPid);
+  server.on("/setadvanced", HTTP_GET, handleSetAdvanced);
   
-  // --- Start Server ---
   server.begin();
+  Serial.println("HTTP server started");
 
-  // --- Initialize PID ---
   Setpoint = targetCurrent_mA;
   myPID.SetMode(AUTOMATIC);
+  // Set PID output limits to a standard 8-bit range for both platforms.
   myPID.SetOutputLimits(0, 255);
 }
 
 void loop() {
-  // --- Read Sensors ---
+  server.handleClient();
+
   busVoltage_V = ina219.getBusVoltage();
   current_mA = ina219.getCurrent_mA();
 
-  // --- Safety Check: Voltage Limit Override ---
   if (busVoltage_V >= MAXIMUM_BUS_VOLTAGE_INA219 && targetCurrent_mA > current_mA) {
+    // Safety override is now platform-agnostic.
     dacWrite(DAC_PIN, DAC_SAFETY_VALUE);
   } else {
-    // --- Normal PID Operation ---
     Input = current_mA;
     myPID.Compute();
-    setBuckFeedback(Output);
+    setOutputLevel(Output);
   }
-
-  // --- Send Data via SSE at the specified interval ---
-  static unsigned long lastEventTime = 0;
-  if (millis() - lastEventTime > sseInterval) {
-    lastEventTime = millis();
-    
-    // Create a JSON string with all relevant data
-    String jsonData = "{";
-    jsonData += "\"voltage\":" + String(busVoltage_V, 2);
-    jsonData += ", \"current\":" + String(current_mA, 2);
-    jsonData += ", \"setpoint\":" + String(targetCurrent_mA, 2);
-    jsonData += ", \"kp\":" + String(Kp);
-    jsonData += ", \"ki\":" + String(Ki);
-    jsonData += ", \"kd\":" + String(Kd);
-    jsonData += ", \"max_limit\":" + String(maxCurrentLimit_mA);
-    jsonData += ", \"sse_interval\":" + String(sseInterval / 1000.0, 1);
-    jsonData += "}";
-    
-    events.send(jsonData.c_str(), "message", millis());
-  }
-
-  delay(10);
 }

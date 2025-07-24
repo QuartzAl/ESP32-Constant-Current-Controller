@@ -1,9 +1,11 @@
-#include <pgmspace.h>
+#pragma once
+
+// index.h
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html>
 <head>
-  <title>ESP32 Current Source</title>
+  <title>ESP Current Source</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
@@ -21,8 +23,9 @@ const char index_html[] PROGMEM = R"rawliteral(
     input[type="range"]::-moz-range-thumb { width: 20px; height: 20px; background: #1877f2; cursor: pointer; border-radius: 50%; }
     input[type="number"] { width: 80px; padding: 8px 10px; border-radius: 5px; border: 1px solid #ccc; }
     .control-group, .setting-group { display: flex; justify-content: space-between; align-items: center; gap: 15px; margin-bottom: 15px; }
-    button { background-color: #1877f2; color: white; padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; }
+    button { background-color: #1877f2; color: white; padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; transition: background-color 0.2s; }
     button:hover { background-color: #166fe5; }
+    button:disabled { background-color: #cccccc; }
     .pid-inputs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
     .chart-container { margin-top: 30px; }
     .download-btn { background-color: #28a745; margin-top: 15px; width: 100%; }
@@ -33,7 +36,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div class="container">
-    <h2>ESP32 Constant Current Source Controller</h2>
+    <h2>ESP Constant Current Source Controller</h2>
     
     <div class="grid-container">
       <div class="card">
@@ -49,7 +52,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div class="control-group">
             <label for="targetCurrentInput">Target (mA):</label>
             <input type="number" id="targetCurrentInput" min="0" step="1" onchange="updateSliderFromInput()">
-            <button onclick="setTargetCurrent()">Set</button>
+            <button onclick="setTargetCurrent(this)">Set</button>
         </div>
         <input type="range" id="targetCurrentSlider" min="0" step="1" oninput="updateInputFromSlider(this.value)">
       </div>
@@ -62,7 +65,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div><label for="ki">Ki</label><input type="number" id="ki" step="0.1"></div>
             <div><label for="kd">Kd</label><input type="number" id="kd" step="0.1"></div>
         </div>
-        <button onclick="setPIDTunings()" style="width: 100%; margin-top: 10px;">Set Tunings</button>
+        <button onclick="setPIDTunings(this)" style="width: 100%; margin-top: 10px;">Set Tunings</button>
     </div>
 
     <div class="chart-container">
@@ -78,21 +81,72 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <input type="number" id="maxCurrent" step="10">
             </div>
             <div class="setting-group">
-                <label for="sseInterval">Update Interval (s):</label>
-                <input type="number" id="sseInterval" min="0.1" step="0.1">
+                <label for="updateInterval">Update Interval (s):</label>
+                <input type="number" id="updateInterval" min="0.1" step="0.1" value="1.0">
             </div>
             <div class="setting-group">
                 <label for="chartPoints">Chart History (points):</label>
                 <input type="number" id="chartPoints" min="10" step="10">
             </div>
-            <button onclick="setAdvancedSettings()" style="width: 100%; margin-top: 10px;">Set Advanced</button>
+            <button onclick="setAdvancedSettings(this)" style="width: 100%; margin-top: 10px;">Set Advanced</button>
         </div>
     </details>
   </div>
 
 <script>
 let chart;
-let chartDataPoints = 60; // Default value
+let chartDataPoints = 60;
+let updateIntervalHandle;
+let updateIntervalMs = 1000;
+
+function fetchData() {
+    fetch('/data')
+      .then(response => response.ok ? response.json() : Promise.reject('Network response was not ok'))
+      .then(data => updateUI(data))
+      .catch(error => console.error('Error fetching data:', error));
+}
+
+function updateUI(data) {
+    document.getElementById('voltage').innerText = data.voltage;
+    document.getElementById('current').innerText = data.current;
+    
+    document.getElementById('voltageWarning').style.display = data.voltage >= 25 ? 'inline' : 'none';
+    
+    const activeId = document.activeElement.id;
+    if (activeId !== 'targetCurrentInput' && activeId !== 'targetCurrentSlider') {
+        document.getElementById('targetCurrentInput').value = data.setpoint;
+        document.getElementById('targetCurrentSlider').value = data.setpoint;
+    }
+    
+    if (activeId !== 'maxCurrent') document.getElementById('maxCurrent').value = data.max_limit;
+    
+    document.getElementById('targetCurrentSlider').max = data.max_limit;
+    document.getElementById('targetCurrentInput').max = data.max_limit;
+
+    if (activeId !== 'kp') document.getElementById('kp').value = data.kp;
+    if (activeId !== 'ki') document.getElementById('ki').value = data.ki;
+    if (activeId !== 'kd') document.getElementById('kd').value = data.kd;
+    
+    const time = new Date().toLocaleTimeString();
+    addDataToChart(time, data.current, data.setpoint, data.voltage);
+}
+
+function showButtonFeedback(button, originalText, success) {
+    if (success) {
+        button.innerText = 'Updated!';
+        button.style.backgroundColor = '#28a745';
+    } else {
+        button.innerText = 'Failed!';
+        button.style.backgroundColor = '#dc3545'; // Red for error
+    }
+    button.disabled = true;
+
+    setTimeout(() => {
+        button.innerText = originalText;
+        button.style.backgroundColor = '#1877f2';
+        button.disabled = false;
+    }, 1500);
+}
 
 window.onload = function() {
   document.getElementById('chartPoints').value = chartDataPoints;
@@ -110,35 +164,46 @@ window.onload = function() {
           yCurrent: { type: 'linear', position: 'left', title: { display: true, text: 'Current (mA)' }, beginAtZero: true },
           yVoltage: { type: 'linear', position: 'right', title: { display: true, text: 'Voltage (V)' }, beginAtZero: true, grid: { drawOnChartArea: false } }
       },
-      animation: { duration: 250 }
+      animation: { duration: 0 }
     }
   });
+  
+  fetchData();
+  updateIntervalHandle = setInterval(fetchData, updateIntervalMs);
 };
 
 function updateInputFromSlider(value) { document.getElementById('targetCurrentInput').value = value; }
 function updateSliderFromInput() { document.getElementById('targetCurrentSlider').value = document.getElementById('targetCurrentInput').value; }
 
-function setTargetCurrent() {
+function setTargetCurrent(button) {
   var value = document.getElementById('targetCurrentInput').value;
-  fetch(`/set?current=${value}`).catch(err => console.error(err));
+  fetch(`/set?current=${value}`)
+    .then(response => showButtonFeedback(button, 'Set', response.ok))
+    .catch(err => showButtonFeedback(button, 'Set', false));
 }
 
-function setPIDTunings() {
+function setPIDTunings(button) {
     var kp = document.getElementById('kp').value;
     var ki = document.getElementById('ki').value;
     var kd = document.getElementById('kd').value;
-    fetch(`/setpid?kp=${kp}&ki=${ki}&kd=${kd}`).catch(err => console.error(err));
+    fetch(`/setpid?kp=${kp}&ki=${ki}&kd=${kd}`)
+     .then(response => showButtonFeedback(button, 'Set Tunings', response.ok))
+     .catch(err => showButtonFeedback(button, 'Set Tunings', false));
 }
 
-function setAdvancedSettings() {
+function setAdvancedSettings(button) {
     var max = document.getElementById('maxCurrent').value;
-    var interval = document.getElementById('sseInterval').value;
+    var interval = document.getElementById('updateInterval').value;
     chartDataPoints = document.getElementById('chartPoints').value;
     
-    document.getElementById('targetCurrentSlider').max = max;
-    document.getElementById('targetCurrentInput').max = max;
-
-    fetch(`/setadvanced?max=${max}&interval=${interval}`).catch(err => console.error(err));
+    if (interval < 0.1) interval = 0.1;
+    updateIntervalMs = interval * 1000;
+    clearInterval(updateIntervalHandle);
+    updateIntervalHandle = setInterval(fetchData, updateIntervalMs);
+    
+    fetch(`/setadvanced?max=${max}`)
+     .then(response => showButtonFeedback(button, 'Set Advanced', response.ok))
+     .catch(err => showButtonFeedback(button, 'Set Advanced', false));
 }
 
 function addDataToChart(label, current, setpoint, voltage) {
@@ -169,40 +234,6 @@ function downloadCSV() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-}
-
-if (!!window.EventSource) {
-  var source = new EventSource('/events');
-  source.onopen = e => console.log("Events Connected");
-  source.onerror = e => { if (e.target.readyState != EventSource.OPEN) console.log("Events Disconnected"); };
-  source.onmessage = e => {
-    const data = JSON.parse(e.data);
-    document.getElementById('voltage').innerText = data.voltage;
-    document.getElementById('current').innerText = data.current;
-    
-    // Client-side voltage warning
-    if (data.voltage >= 25) {
-        document.getElementById('voltageWarning').style.display = 'inline';
-    } else {
-        document.getElementById('voltageWarning').style.display = 'none';
-    }
-    
-    document.getElementById('targetCurrentInput').value = data.setpoint;
-    document.getElementById('targetCurrentSlider').value = data.setpoint;
-    
-    document.getElementById('maxCurrent').value = data.max_limit;
-    document.getElementById('targetCurrentSlider').max = data.max_limit;
-    document.getElementById('targetCurrentInput').max = data.max_limit;
-    
-    document.getElementById('sseInterval').value = data.sse_interval;
-
-    document.getElementById('kp').value = data.kp;
-    document.getElementById('ki').value = data.ki;
-    document.getElementById('kd').value = data.kd;
-    
-    const time = new Date().toLocaleTimeString();
-    addDataToChart(time, data.current, data.setpoint, data.voltage);
-  };
 }
 </script>
 </body>
